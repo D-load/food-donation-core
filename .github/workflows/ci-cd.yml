@@ -1,0 +1,89 @@
+name: CI/CD Food Donations
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+jobs:
+  test-and-quality:
+    runs-on: ubuntu-latest
+    env:
+      PYTHON_VERSION: '3.11'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run unit tests with coverage
+        run: |
+          python -m pytest --cov=app --cov-report=xml --cov-report=term-missing --cov-fail-under=80 tests/
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+      - name: SonarQube analysis
+        if: ${{ secrets.SONAR_TOKEN != '' && secrets.SONAR_HOST_URL != '' }}
+        uses: SonarSource/sonarqube-scan-action@v2
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  security-scan:
+    needs: test-and-quality
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t food-donations-core:${{ github.sha }} .
+
+      - name: Start test environment
+        run: docker compose up -d --build
+
+      - name: Run OWASP ZAP baseline scan
+        continue-on-error: true
+        run: |
+          docker run --rm --network host \
+            -v "${{ github.workspace }}:/zap/wrk/:rw" \
+            owasp/zap2docker-stable:latest \
+            zap-baseline.py -t http://127.0.0.1:8000 -g gen.conf -r zap-report.html || true
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-report
+          path: zap-report.html
+
+  deploy-test:
+    needs: [test-and-quality, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: testing
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and deploy app to test environment
+        run: |
+          docker compose build
+          docker compose up -d
+
+      - name: Smoke test
+        run: |
+          curl --fail --silent http://127.0.0.1:8000/health
